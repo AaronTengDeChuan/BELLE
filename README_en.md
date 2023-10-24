@@ -245,7 +245,7 @@ Please cite us when using our code, data or model.
 
 ```
 @misc{BELLE,
-  author = {Yunjie Ji, Yong Deng, Yan Gong, Yiping Peng, Qiang Niu, Baochang Ma and Xiangang Li},
+  author = {BELLEGroup},
   title = {BELLE: Be Everyone's Large Language model Engine},
   year = {2023},
   publisher = {GitHub},
@@ -257,6 +257,13 @@ Please cite us when using our code, data or model.
   title={Exploring the Impact of Instruction Data Scaling on Large Language Models: An Empirical Study on Real-World Use Cases},
   author={Yunjie Ji, Yong Deng, Yan Gong, Yiping Peng, Qiang Niu, Lei Zhang, Baochang Ma, Xiangang Li},
   journal={arXiv preprint arXiv:2303.14742},
+  year={2023}
+}
+
+@article{wen2023chathome,
+  title={ChatHome: Development and Evaluation of a Domain-Specific Language Model for Home Renovation},
+  author={Wen, Cheng and Sun, Xianghui and Zhao, Shuaijiang and Fang, Xiaoquan and Chen, Liangyu and Zou, Wei},
+  journal={arXiv preprint arXiv:2307.15290},
   year={2023}
 }
 ```
