@@ -5,11 +5,12 @@ __pycache__
 regen.json
 .ipynb_checkpoints
 .idea
-saved_models
+saved_models/
 *.code-workspace
 .hypothesis
 infer_res
-wandb
-hf_cache_dir
+wandb/
+hf_cache_dir/
 data
-dcteng_data
+dcteng_data/
+sbatch_logs/
