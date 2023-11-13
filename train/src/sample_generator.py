@@ -43,7 +43,9 @@ def generate_and_tokenize_prompt(
     padding_side="left",
 ):
     conversations = data_point["conversations"]
-    input_ids, labels = sft_sample_to_ids(conversations, tokenizer)
+    # input_ids, labels = sft_sample_to_ids(conversations, tokenizer)
+    input_ids, labels = tod_sft_sample_to_ids(conversations, tokenizer)
+    assert len(input_ids) <= model_max_length
 
     input_ids = input_ids[:model_max_length]
     labels = labels[:model_max_length]
@@ -175,3 +177,33 @@ def inference_generate(
     return {
         "input_ids": tokenizer.encode(text, add_special_tokens=False)[:model_max_length]
     }
+
+
+# ToD sft sample generator
+def tod_sft_sample_to_ids(conversations: Dict[str, Any], tokenizer: PreTrainedTokenizer):
+    input_ids = []
+    labels = []
+    sys_ids = tokenizer.encode(conversations[0], add_special_tokens=False)
+    input_ids += sys_ids
+    labels += [IGNORE_INDEX] * len(sys_ids)
+    for turn in conversations[1]:
+        for sentence, enable_loss in zip(turn[0], turn[1]):
+            sentence_ids = tokenizer.encode(sentence, add_special_tokens=False)
+            input_ids += sentence_ids
+            labels += copy.deepcopy(sentence_ids) if enable_loss else [IGNORE_INDEX] * len(sentence_ids)
+    return input_ids, labels
+
+
+def batch_group_tod_sft_generate(
+    model_max_length: int,
+    tokenizer: PreTrainedTokenizer,
+    examples: Dict[str, List[Any]],
+) -> Dict[str, List[List[int]]]:
+    input_ids_list = []
+    labels_list = []
+    for conversations in examples["conversations"]:
+        input_ids, labels = tod_sft_sample_to_ids(conversations, tokenizer)
+        assert len(input_ids) <= model_max_length
+        input_ids_list.append(input_ids + [tokenizer.pad_token_id] * (model_max_length - len(input_ids)))
+        labels_list.append(labels + [IGNORE_INDEX] * (model_max_length - len(labels)))
+    return {"input_ids": input_ids_list, "labels": labels_list}

@@ -28,6 +28,7 @@ from src.utils import get_model_param_count
 from src.sample_generator import (
     batch_grouped_sft_generate,
     generate_and_tokenize_prompt,
+    batch_group_tod_sft_generate,
 )
 from src.models.llama.modeling_llama import LlamaForCausalLM
 
@@ -155,6 +156,19 @@ def print_rank_0(msg, log_file, rank=0):
             f.write(msg + "\n")
 
 
+def get_additional_special_tokens(tokenizer, data_dir):
+    additional_special_tokens = tokenizer.additional_special_tokens
+    sp_embed_mapping = {}
+    sp_tokens_file = os.path.join(data_dir, "special_tokens.json")
+    if os.path.exists(sp_tokens_file):
+        # import additional special tokens and initial embedding mapping
+        sp_tokens_dict, sp_target_dict = json.load(open(sp_tokens_file))
+        additional_special_tokens.extend(list(sp_tokens_dict.values()))
+        for sp_name, sp_target in sp_target_dict.items():
+            sp_embed_mapping[sp_tokens_dict[sp_name]] = sp_target
+    return additional_special_tokens, sp_embed_mapping
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -243,6 +257,7 @@ def main():
                 torch_dtype=torch_dtype,
             )
 
+    data_dir = os.path.dirname(data_args.train_file)
     if model_args.llama:
         tokenizer = LlamaTokenizer.from_pretrained(model_args.model_name_or_path)
         print_rank_0(
@@ -250,11 +265,48 @@ def main():
             log_file,
             global_rank,
         )
-        tokenizer.add_special_tokens({'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>', 'pad_token': '<unk>'})
+        additional_special_tokens, sp_embed_mapping = get_additional_special_tokens(tokenizer, data_dir)
+        tokenizer.add_special_tokens({'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>', 'pad_token': '<unk>',
+                                      'additional_special_tokens': additional_special_tokens})
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
-        tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token})
+        additional_special_tokens, sp_embed_mapping = get_additional_special_tokens(tokenizer, data_dir)
+        tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token,
+                                      "additional_special_tokens": additional_special_tokens})
     tokenizer.padding_side = "left"  # Allow batched inference
+
+    # resize token embeddings
+    embedding_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
+        print_rank_0(
+            "Resizing token embeddings from {} to {}".format(
+                embedding_size, model.get_input_embeddings().weight.shape[0]
+            ),
+            log_file,
+            global_rank,
+        )
+        # initialize new tokens
+        for sp_token, sp_target in sp_embed_mapping.items():
+            # check if sp_token is in tokenizer
+            assert sp_token in tokenizer.get_vocab(), f"{sp_token} not in tokenizer"
+            sp_token_id1 = tokenizer.convert_tokens_to_ids(sp_token)
+            sp_token_id2 = tokenizer.additional_special_tokens_ids[tokenizer.additional_special_tokens.index(sp_token)]
+            assert sp_token_id1 == sp_token_id2, f"{sp_token} {sp_token_id1} {sp_token_id2}"
+            # check if sp_target is in tokenizer
+            assert hasattr(tokenizer, sp_target), f"{sp_target} not in tokenizer"
+            sp_target_token = getattr(tokenizer, sp_target)
+            assert isinstance(sp_target_token, str), f"{sp_target} is not a str"
+            sp_target_id = tokenizer.convert_tokens_to_ids(sp_target_token)
+            # initialize new token
+            model.get_input_embeddings().weight.data[sp_token_id1] = model.get_input_embeddings().weight.data[sp_target_id]
+            print_rank_0(
+                "Initialize {} with {}".format(
+                    sp_token, sp_target_token
+                ),
+                log_file,
+                global_rank,
+            )
 
     print_rank_0(
         "tokenizer.eos_token_id = {}".format(tokenizer.eos_token_id),
@@ -268,6 +320,13 @@ def main():
     )
     print_rank_0(
         "tokenizer.bos_token_id = {}".format(tokenizer.bos_token_id),
+        log_file,
+        global_rank,
+    )
+    print_rank_0(
+        "tokenizer.additional_special_tokens = {}".format(
+           " ; ".join([f"{tok}={tok_id}" for tok, tok_id in
+                       zip(tokenizer.additional_special_tokens, tokenizer.additional_special_tokens_ids)])),
         log_file,
         global_rank,
     )
@@ -335,7 +394,8 @@ def main():
                 .shuffle()
                 .map(
                     partial(
-                        batch_grouped_sft_generate,
+                        # batch_grouped_sft_generate,
+                        batch_group_tod_sft_generate,
                         training_args.model_max_length,
                         tokenizer,
                     ),
@@ -349,7 +409,8 @@ def main():
                 val_data["train"]
                 .map(
                     partial(
-                        batch_grouped_sft_generate,
+                        # batch_grouped_sft_generate,
+                        batch_group_tod_sft_generate,
                         training_args.model_max_length,
                         tokenizer,
                     ),

@@ -43,7 +43,7 @@ case ${ComputingPlatform} in
     conda env list
 
     # specify model_name_or_path and report_to
-    model_name_or_path=/share/home/xuyang/model/llama2/Llama-2-7b-hf
+    model_name_or_path=/share/home/xuyang/dcteng/models/llama2/Llama-2-7b-hf
     report_to=tensorboard
   ;;
 2)  # for SCIR-HPC
@@ -60,7 +60,7 @@ case ${ComputingPlatform} in
     pyenv versions
 
     # specify model_name_or_path and report_to
-    model_name_or_path=/home/share/model/llama2/Llama-2-7b-hf
+    model_name_or_path=/home/dcteng/models/llama2/Llama-2-7b-hf
     report_to=wandb
   ;;
 esac
@@ -113,8 +113,10 @@ export WANDB_PROJECT=ToD
 export WANDB_RESUME=allow
 
 # NOTE: Before training the model, check if there is empty string in each message of each dialogue.
-train_file="$ABS_PATH/BELLE/dcteng_data/shareGPT/ShareGPT_V3_unfiltered_cleaned_dcteng-train.json"
-validation_file="$ABS_PATH/BELLE/dcteng_data/shareGPT/ShareGPT_V3_unfiltered_cleaned_dcteng-dev.json"
+#train_file="$ABS_PATH/BELLE/dcteng_data/shareGPT/ShareGPT_V3_unfiltered_cleaned_dcteng-train.json"
+#validation_file="$ABS_PATH/BELLE/dcteng_data/shareGPT/ShareGPT_V3_unfiltered_cleaned_dcteng-dev.json"
+train_file="$ABS_PATH/BELLE/dcteng_data/sftToD/v1.0/multiwoz2.1/train.json"
+validation_file="$ABS_PATH/BELLE/dcteng_data/sftToD/v1.0/multiwoz2.1/dev.json"
 
 cache_dir=hf_cache_dir
 mkdir -p ${cache_dir}
@@ -130,6 +132,9 @@ DISTRIBUTED_ARGS="--nproc_per_node ${NUM_GPUS} --master_port ${MAIN_PROCESS_PORT
 echo "DISTRIBUTED_ARGS: $DISTRIBUTED_ARGS"
 
 echo "Manual ARGS:      $@"
+
+# simplify above codes
+flash_attn=$(echo "$@" | grep -oE -- "--use_flash_attention" | wc -l)
 
 if [[ "$@" =~ "--use_lora" ]]
 then
@@ -166,23 +171,47 @@ then
         --cache_dir ${cache_dir} \
         --output_dir ${output_dir} \
         --deepspeed configs/deepspeed_config.json \
-        --use_flash_attention \
         --report_to ${report_to} \
         "${@}"
-       # --resume_from_checkpoint ...
+#        --use_flash_attention \
+#        --resume_from_checkpoint ...
 else
     case ${NUM_GPUS} in
     2)
-        per_device_train_batch_size=4
-        per_device_eval_batch_size=16
+        case $flash_attn in
+        0)
+            per_device_train_batch_size=2
+            per_device_eval_batch_size=4
+            ;;
+        *)
+            per_device_train_batch_size=4
+            per_device_eval_batch_size=8
+            ;;
+        esac
         ;;
     4)
-        per_device_train_batch_size=8
-        per_device_eval_batch_size=32
+        case $flash_attn in
+        0)
+            per_device_train_batch_size=4
+            per_device_eval_batch_size=8
+            ;;
+        *)
+            per_device_train_batch_size=8
+            per_device_eval_batch_size=16
+            ;;
+        esac
         ;;
     8)
-        per_device_train_batch_size=8
-        per_device_eval_batch_size=32
+        case $flash_attn in
+        0)
+            per_device_train_batch_size=4
+            per_device_eval_batch_size=8
+            ;;
+        *)
+            per_device_train_batch_size=8
+            per_device_eval_batch_size=16
+            ;;
+        esac
         ;;
     esac
     echo "per_device_train_batch_size: $per_device_train_batch_size"
@@ -218,9 +247,9 @@ else
         --cache_dir ${cache_dir} \
         --output_dir ${output_dir} \
         --deepspeed configs/deepspeed_config_stage3_no_offload.json \
-        --use_flash_attention \
         --report_to ${report_to} \
         "${@}"
+#        --use_flash_attention \
 #         --resume_from_checkpoint ...
 fi
 
