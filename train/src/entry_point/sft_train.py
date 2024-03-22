@@ -1,4 +1,4 @@
-from transformers.utils import add_start_docstrings
+from transformers.utils import add_start_docstrings, is_flash_attn_2_available
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.trainer_pt_utils import torch_distributed_zero_first
 from transformers import (
@@ -30,7 +30,8 @@ from src.sample_generator import (
     generate_and_tokenize_prompt,
     batch_group_tod_sft_generate,
 )
-from src.models.llama.modeling_llama import LlamaForCausalLM
+from transformers import LlamaForCausalLM
+# from src.models.llama.modeling_llama import LlamaForCausalLM
 
 if version.parse(transformers.__version__) <= version.parse("4.30.2"):
     from src.trainer import MyTrainer as Trainer
@@ -90,6 +91,9 @@ class DataArguments:
             "help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."
         },
     )
+    only_assistant_loss: bool = field(
+        default=False, metadata={"help": "Whether to only compute assistant loss."}
+    )
 
 
 @dataclass
@@ -131,6 +135,12 @@ class TrainingArguments(TrainingArguments):
             )
         },
     )
+    per_epoch_eval_frequency: int = field(
+        default=4,
+        metadata={
+            "help": "How often to perform evaluation at each epoch. Default is 4 times per epoch."
+        },
+    )
     report_to: str = field(
         default="wandb",
         metadata={
@@ -156,22 +166,11 @@ def print_rank_0(msg, log_file, rank=0):
             f.write(msg + "\n")
 
 
-def get_additional_special_tokens(tokenizer, data_dir):
-    additional_special_tokens = tokenizer.additional_special_tokens
-    sp_embed_mapping = {}
-    sp_tokens_file = os.path.join(data_dir, "special_tokens.json")
-    if os.path.exists(sp_tokens_file):
-        # import additional special tokens and initial embedding mapping
-        sp_tokens_dict, sp_target_dict = json.load(open(sp_tokens_file))
-        additional_special_tokens.extend(list(sp_tokens_dict.values()))
-        for sp_name, sp_target in sp_target_dict.items():
-            sp_embed_mapping[sp_tokens_dict[sp_name]] = sp_target
-    return additional_special_tokens, sp_embed_mapping
-
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    assert not model_args.use_flash_attention or is_flash_attn_2_available(), f"Flash attention is not available for the current environment. Please install flash_attention or use a different environment."
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     global_rank = torch.distributed.get_rank()
@@ -199,6 +198,7 @@ def main():
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, distributed training: {bool(training_args.local_rank != -1)}, fp16-bits training: {training_args.fp16}, bf16-bits training: {training_args.bf16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"Data parameters {data_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -224,7 +224,7 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
     training_args._frozen = False
-    training_args.data_seed = training_args.seed
+    # training_args.data_seed = training_args.seed
 
     torch_dtype = (
         model_args.torch_dtype
@@ -249,15 +249,17 @@ def main():
             model = LlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 torch_dtype=torch_dtype,
+                use_flash_attention_2=model_args.use_flash_attention
             )
-            model.config.use_flash_attention = model_args.use_flash_attention
+            # model.config.use_flash_attention = model_args.use_flash_attention
+            # model.config._flash_attn_2_enabled = model_args.use_flash_attention
+            print_rank_0(f"LLaMa Attention: {model.model.layers[0].self_attn}", log_file, global_rank)
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 torch_dtype=torch_dtype,
             )
 
-    data_dir = os.path.dirname(data_args.train_file)
     if model_args.llama:
         tokenizer = LlamaTokenizer.from_pretrained(model_args.model_name_or_path)
         print_rank_0(
@@ -265,48 +267,11 @@ def main():
             log_file,
             global_rank,
         )
-        additional_special_tokens, sp_embed_mapping = get_additional_special_tokens(tokenizer, data_dir)
-        tokenizer.add_special_tokens({'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>', 'pad_token': '<unk>',
-                                      'additional_special_tokens': additional_special_tokens})
+        tokenizer.add_special_tokens({'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>', 'pad_token': '<unk>'})
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
-        additional_special_tokens, sp_embed_mapping = get_additional_special_tokens(tokenizer, data_dir)
-        tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token,
-                                      "additional_special_tokens": additional_special_tokens})
+        tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token})
     tokenizer.padding_side = "left"  # Allow batched inference
-
-    # resize token embeddings
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
-        print_rank_0(
-            "Resizing token embeddings from {} to {}".format(
-                embedding_size, model.get_input_embeddings().weight.shape[0]
-            ),
-            log_file,
-            global_rank,
-        )
-        # initialize new tokens
-        for sp_token, sp_target in sp_embed_mapping.items():
-            # check if sp_token is in tokenizer
-            assert sp_token in tokenizer.get_vocab(), f"{sp_token} not in tokenizer"
-            sp_token_id1 = tokenizer.convert_tokens_to_ids(sp_token)
-            sp_token_id2 = tokenizer.additional_special_tokens_ids[tokenizer.additional_special_tokens.index(sp_token)]
-            assert sp_token_id1 == sp_token_id2, f"{sp_token} {sp_token_id1} {sp_token_id2}"
-            # check if sp_target is in tokenizer
-            assert hasattr(tokenizer, sp_target), f"{sp_target} not in tokenizer"
-            sp_target_token = getattr(tokenizer, sp_target)
-            assert isinstance(sp_target_token, str), f"{sp_target} is not a str"
-            sp_target_id = tokenizer.convert_tokens_to_ids(sp_target_token)
-            # initialize new token
-            model.get_input_embeddings().weight.data[sp_token_id1] = model.get_input_embeddings().weight.data[sp_target_id]
-            print_rank_0(
-                "Initialize {} with {}".format(
-                    sp_token, sp_target_token
-                ),
-                log_file,
-                global_rank,
-            )
 
     print_rank_0(
         "tokenizer.eos_token_id = {}".format(tokenizer.eos_token_id),
@@ -381,28 +346,34 @@ def main():
 
     with torch_distributed_zero_first(global_rank):
         train_data = load_dataset(
-            "json", data_files=data_args.train_file, cache_dir=model_args.cache_dir
+            "json", data_files=data_args.train_file,
+            cache_dir=model_args.cache_dir,
+            keep_in_memory=False
         )
 
         val_data = load_dataset(
-            "json", data_files=data_args.validation_file, cache_dir=model_args.cache_dir
+            "json", data_files=data_args.validation_file,
+            cache_dir=model_args.cache_dir,
+            keep_in_memory=False
         )
 
         if model_args.use_flash_attention:
             train_data = (
                 train_data["train"]
-                .shuffle()
                 .map(
                     partial(
                         # batch_grouped_sft_generate,
                         batch_group_tod_sft_generate,
                         training_args.model_max_length,
                         tokenizer,
+                        data_args.only_assistant_loss,
                     ),
                     batched=True,
+                    num_proc=8,
                     desc=f"Grouping texts in chunks of {training_args.model_max_length}",
                     remove_columns=["id", "conversations"],
                 )
+                .shuffle(seed=training_args.data_seed)
             )
 
             val_data = (
@@ -413,8 +384,10 @@ def main():
                         batch_group_tod_sft_generate,
                         training_args.model_max_length,
                         tokenizer,
+                        True,
                     ),
                     batched=True,
+                    num_proc=8,
                     desc=f"Grouping texts in chunks of {training_args.model_max_length}",
                     remove_columns=["id", "conversations"],
                 )
@@ -422,14 +395,15 @@ def main():
         else:
             train_data = (
                 train_data["train"]
-                .shuffle()
                 .map(
                     partial(
                         generate_and_tokenize_prompt,
                         training_args.model_max_length,
                         tokenizer,
+                        data_args.only_assistant_loss,
                     )
                 )
+                .shuffle(seed=training_args.data_seed)
             )
 
             val_data = (
@@ -439,6 +413,7 @@ def main():
                         generate_and_tokenize_prompt,
                         training_args.model_max_length,
                         tokenizer,
+                        True,
                     )
                 )
             )
@@ -463,7 +438,7 @@ def main():
     # train steps
     t_total = math.ceil(training_nums / batch_size) * training_args.num_train_epochs
     # eval steps
-    training_args.eval_steps = max(t_total // (training_args.num_train_epochs * 4), 5)
+    training_args.eval_steps = max(t_total // (training_args.num_train_epochs * training_args.per_epoch_eval_frequency), 5)
     # save steps
     training_args.save_steps = training_args.eval_steps
     training_args.warmup_steps = (
@@ -570,3 +545,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # terminate this program
+    exit(0)
